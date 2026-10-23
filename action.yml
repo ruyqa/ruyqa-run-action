@@ -1,0 +1,217 @@
+name: 'RuyQA: Upload Test Results'
+description: 'Upload JUnit XML or JSON test results to RuyQA'
+author: 'RuyQA'
+
+inputs:
+  file:
+    description: 'Path to test results file (JUnit XML, Playwright JSON, or generic JSON)'
+    required: true
+  format:
+    description: 'File format (junit, playwright, json)'
+    required: false
+    default: 'junit'
+  title:
+    description: 'Test run title'
+    required: false
+  project:
+    description: 'RuyQA project slug (overrides ruyqa.yml)'
+    required: false
+  browser:
+    description: 'Browser the tests ran in (chromium, firefox, webkit). Lets the Cross Browser agent compare runs'
+    required: false
+    default: ''
+  analyze:
+    description: 'Run AI failure analysis'
+    required: false
+    default: 'false'
+  api-key:
+    description: 'RuyQA API key (prefer RUYQA_API_KEY secret)'
+    required: false
+  verify:
+    description: 'Judge the pull request or commit against the uploaded results and report a verdict'
+    required: false
+    default: 'true'
+  fail-on:
+    description: 'Fail the job on this verdict: needs-attention (default), unverified (also fail when nothing proves the change), or never'
+    required: false
+    default: 'needs-attention'
+  github-token:
+    description: 'Token used to post the verdict as a PR comment (usually secrets.GITHUB_TOKEN). Needs pull-requests: write'
+    required: false
+  api-url:
+    description: 'RuyQA API base URL'
+    required: false
+    default: 'https://api.ruyqa.com/api/v1'
+
+outputs:
+  run-id:
+    description: 'RuyQA test run ID'
+    value: ${{ steps.upload.outputs.run-id }}
+  url:
+    description: 'URL to view the test run'
+    value: ${{ steps.upload.outputs.url }}
+  passed:
+    description: 'Number of passed tests'
+    value: ${{ steps.upload.outputs.passed }}
+  failed:
+    description: 'Number of failed tests'
+    value: ${{ steps.upload.outputs.failed }}
+  total:
+    description: 'Total number of tests'
+    value: ${{ steps.upload.outputs.total }}
+  verdict:
+    description: 'VERIFIED, NEEDS_ATTENTION, UNVERIFIED or PENDING'
+    value: ${{ steps.verify.outputs.verdict }}
+  verification-id:
+    description: 'RuyQA verification ID'
+    value: ${{ steps.verify.outputs.verification-id }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Download RuyQA CLI
+      shell: bash
+      run: |
+        if command -v ruyqa &>/dev/null; then
+          echo "ruyqa already installed"
+          exit 0
+        fi
+        OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+        ARCH=$(uname -m)
+        [ "$ARCH" = "aarch64" ] && ARCH="arm64"
+        [ "$ARCH" = "x86_64" ] && ARCH="amd64"
+        VERSION="0.1.0"
+        URL="https://github.com/ruyqa/ruyqa-cli/releases/download/v${VERSION}/ruyqa-${OS}-${ARCH}"
+        echo "Downloading ruyqa from $URL"
+        curl -sL "$URL" -o /usr/local/bin/ruyqa
+        chmod +x /usr/local/bin/ruyqa
+        ruyqa version
+
+    - name: Create ruyqa.yml if missing
+      shell: bash
+      run: |
+        if [ ! -f ruyqa.yml ]; then
+          ruyqa init --force
+        fi
+
+    - name: Upload test results
+      id: upload
+      shell: bash
+      env:
+        RUYQA_API_KEY: ${{ inputs.api-key || env.RUYQA_API_KEY }}
+        RUYQA_API_URL: ${{ inputs.api-url }}
+      run: |
+        ARGS="--file ${{ inputs.file }} --json"
+        if [ -n "${{ inputs.format }}" ]; then
+          ARGS="$ARGS --format ${{ inputs.format }}"
+        fi
+        if [ -n "${{ inputs.title }}" ]; then
+          ARGS="$ARGS --title '${{ inputs.title }}'"
+        fi
+        if [ -n "${{ inputs.project }}" ]; then
+          ARGS="$ARGS --project ${{ inputs.project }}"
+        fi
+        if [ -n "${{ inputs.browser }}" ]; then
+          ARGS="$ARGS --browser ${{ inputs.browser }}"
+        fi
+        if [ "${{ inputs.analyze }}" = "true" ]; then
+          ARGS="$ARGS --analyze"
+        fi
+        OUTPUT=$(ruyqa run upload $ARGS 2>/dev/null)
+        echo "$OUTPUT"
+        echo "run-id=$(echo "$OUTPUT" | jq -r .run_id)" >> $GITHUB_OUTPUT
+        echo "url=$(echo "$OUTPUT" | jq -r .url)" >> $GITHUB_OUTPUT
+        echo "passed=$(echo "$OUTPUT" | jq -r .passed)" >> $GITHUB_OUTPUT
+        echo "failed=$(echo "$OUTPUT" | jq -r .failed)" >> $GITHUB_OUTPUT
+        echo "total=$(echo "$OUTPUT" | jq -r .total)" >> $GITHUB_OUTPUT
+
+    - name: Verify change
+      if: ${{ inputs.verify == 'true' }}
+      id: verify
+      shell: bash
+      env:
+        RUYQA_API_KEY: ${{ inputs.api-key || env.RUYQA_API_KEY }}
+        API_URL: ${{ inputs.api-url }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        RUN_ID: ${{ steps.upload.outputs.run-id }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_URL: ${{ github.event.pull_request.html_url }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        BRANCH: ${{ github.head_ref || github.ref_name }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+
+        # Files this change touched. Needs full history: use actions/checkout with fetch-depth: 0.
+        if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA" 2>/dev/null; then
+          FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+        else
+          FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || true)
+        fi
+        if [ -z "$FILES" ]; then
+          echo "::warning::RuyQA could not work out the changed files (use actions/checkout with fetch-depth: 0). Skipping verification."
+          exit 0
+        fi
+
+        # Keep RuyQA's picture of the repository current, so it can suggest which tests cover which code.
+        ALL_FILES=$(git ls-files | head -8000 || true)
+        if [ -n "$ALL_FILES" ]; then
+          jq -n --arg files "$ALL_FILES" '{files: ($files | split("\n") | map(select(length>0)))}' | \
+            curl -sS -X PUT "$API_URL/ci/repo-files" -H "X-API-Key: $RUYQA_API_KEY" -H "Content-Type: application/json" -d @- >/dev/null || true
+        fi
+
+        BODY=$(jq -n \
+          --arg sha "$HEAD_SHA" --arg branch "$BRANCH" --arg title "$PR_TITLE" \
+          --arg prurl "$PR_URL" --arg pr "$PR_NUMBER" --arg run "$RUN_ID" \
+          --arg files "$FILES" \
+          '{commit_sha:$sha, branch:$branch, title:$title, pr_url:$prurl,
+            changed_files: ($files | split("\n") | map(select(length>0)))}
+           + (if $pr != "" then {pr_number: ($pr|tonumber), source:"PULL_REQUEST"} else {} end)
+           + (if $run != "" and $run != "null" then {run_id:$run} else {} end)')
+
+        RESP=$(curl -sS --fail-with-body -X POST "$API_URL/ci/verifications" \
+          -H "X-API-Key: $RUYQA_API_KEY" -H "Content-Type: application/json" -d "$BODY")
+
+        VERDICT=$(echo "$RESP" | jq -r .verdict)
+        ID=$(echo "$RESP" | jq -r .id)
+        echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
+        echo "verification-id=$ID" >> "$GITHUB_OUTPUT"
+
+        case "$VERDICT" in
+          VERIFIED) HEAD_LINE="✅ **RuyQA: Verified**" ;;
+          NEEDS_ATTENTION) HEAD_LINE="⚠️ **RuyQA: Needs attention**" ;;
+          UNVERIFIED) HEAD_LINE="❔ **RuyQA: Unverified**" ;;
+          *) HEAD_LINE="⏳ **RuyQA: Pending**" ;;
+        esac
+
+        COMMENT=$(echo "$RESP" | jq -r --arg head "$HEAD_LINE" '
+          [$head, "", .summary,
+           (if (.details.failures|length) > 0 then "", "**Failing tests**", (.details.failures[] | "- `\(.title)`" + (if .error != "" and .error != null then ": \(.error)" else "" end)) else empty end),
+           (if (.details.uncovered_files|length) > 0 then "", "**Changed files with no test evidence**", (.details.uncovered_files[] | "- `\(.)`") else empty end),
+           (if ((.details.likely_tests // {}) | length) > 0 then "", "**Tests that may cover these files (not linked yet)**", ((.details.likely_tests | to_entries[]) | "- `\(.key)`: \(.value | join(", "))") else empty end),
+           (if (.details.notes|length) > 0 then "", (.details.notes[] | "_\(.)_") else empty end)
+          ] | join("\n")')
+
+        echo "$COMMENT" >> "$GITHUB_STEP_SUMMARY"
+
+        if [ -n "${GH_TOKEN:-}" ] && [ -n "$PR_NUMBER" ]; then
+          # Update our previous comment instead of adding a new one per push.
+          MARK="<!-- ruyqa-verdict -->"
+          EXISTING=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --jq ".[] | select(.body | contains(\"$MARK\")) | .id" | head -1 || true)
+          if [ -n "$EXISTING" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$EXISTING" -f body="$MARK
+        $COMMENT" >/dev/null
+          else
+            gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$MARK
+        $COMMENT" >/dev/null
+          fi
+        fi
+
+        case "$FAIL_ON:$VERDICT" in
+          never:*) ;;
+          *:NEEDS_ATTENTION) echo "::error::RuyQA verdict: needs attention. $(echo "$RESP" | jq -r .summary)"; exit 1 ;;
+          unverified:UNVERIFIED) echo "::error::RuyQA verdict: unverified. $(echo "$RESP" | jq -r .summary)"; exit 1 ;;
+        esac
